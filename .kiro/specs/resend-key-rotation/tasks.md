@@ -1,0 +1,140 @@
+# Implementation Plan: resend-key-rotation
+
+## Overview
+
+Implementação do módulo NexusKey: infraestrutura Terraform (Secrets Manager, SSM, IAM, EventBridge, Lambda) + lógica de rotação em Node.js 24.x com validação Zod. O fluxo segue a ordem Gerar → Validar → Persistir → Revogar, com semântica de falha-segura e idempotência.
+
+## Tasks
+
+- [x] 1. Criar estrutura base do módulo Terraform
+  - [x] 1.1 Criar `terraform/versions.tf` com bloco `terraform { required_version }` fixando Terraform 1.17.1 e bloco `required_providers` com `aws >= 6.0, < 7.0`
+    - _Requirements: 10.1_
+  - [x] 1.2 Criar `terraform/variables.tf` com variáveis obrigatórias (`secret_arn`, `parameter_arn`, `rotation_schedule`) e opcionais (`function_name`, `log_retention_days`, `tags`), cada uma com atributo `description` e blocos `validation` conforme especificado
+    - `rotation_schedule`: regex `^(rate|cron)\(` no bloco `validation`
+    - `function_name`: validação de máximo 64 caracteres
+    - `log_retention_days`: conjunto de valores aceitos pelo CloudWatch Logs
+    - `secret_arn` e `parameter_arn`: validação de não vazio
+    - _Requirements: 1.3, 8.5, 10.1, 10.2, 10.4_
+  - [x] 1.3 Criar `terraform/outputs.tf` com os quatro outputs (`lambda_function_arn`, `lambda_function_name`, `secret_arn`, `log_group_name`), marcando `secret_arn` com `sensitive = true` e todos com `description`
+    - _Requirements: 7.3, 10.4_
+
+- [x] 2. Implementar recursos principais em `terraform/main.tf`
+  - [x] 2.1 Declarar `aws_secretsmanager_secret` sem nenhum recurso `aws_secretsmanager_secret_version` associado, aplicando `var.tags`
+    - _Requirements: 4.5, 7.2_
+  - [x] 2.2 Declarar `aws_ssm_parameter` com tipo `String` (não `SecureString`), valor inicial de placeholder `{}`, e `overwrite = true`
+    - _Requirements: 5.2_
+  - [x] 2.3 Declarar `aws_cloudwatch_log_group` com nome `/aws/lambda/${var.function_name}` e `retention_in_days = var.log_retention_days`
+    - _Requirements: 10.2_
+
+- [x] 3. Implementar IAM com privilégio mínimo em `terraform/iam.tf`
+  - [x] 3.1 Declarar `aws_iam_role` com `assume_role_policy` permitindo `lambda.amazonaws.com` assumir a role
+    - _Requirements: 8.1_
+  - [x] 3.2 Declarar a primeira política inline (`aws_iam_role_policy`) para Secrets Manager: ações `secretsmanager:GetSecretValue` e `secretsmanager:PutSecretValue` com `Resource` apontando para `var.secret_arn` exato (sem wildcard)
+    - _Requirements: 8.1, 8.4_
+  - [x] 3.3 Declarar a segunda política inline para SSM Parameter Store: ações `ssm:GetParameter` e `ssm:PutParameter` com `Resource` apontando para `var.parameter_arn` exato (sem wildcard)
+    - _Requirements: 8.2, 8.4_
+  - [x] 3.4 Declarar a terceira política inline para CloudWatch Logs: ações `logs:CreateLogGroup`, `logs:CreateLogStream` e `logs:PutLogEvents` com `Resource` no formato `arn:aws:logs:<region>:<account_id>:log-group:/aws/lambda/<function_name>:*` construído via `data.aws_caller_identity` e `data.aws_region`
+    - Exatamente três políticas inline, sem nenhuma política adicional
+    - _Requirements: 8.3, 8.6_
+
+- [x] 4. Implementar agendamento em `terraform/eventbridge.tf`
+  - [x] 4.1 Declarar `aws_cloudwatch_event_rule` com `schedule_expression = var.rotation_schedule` e `state = "ENABLED"`
+    - _Requirements: 1.1_
+  - [x] 4.2 Declarar `aws_cloudwatch_event_target` apontando para a Lambda e `aws_lambda_permission` concedendo ao EventBridge permissão de invocar a função
+    - _Requirements: 1.2_
+
+- [x] 5. Implementar empacotamento e função Lambda em `terraform/lambda.tf`
+  - [x] 5.1 Declarar `data "archive_file"` empacotando o diretório `lambda/rotation/` em arquivo `.zip` com `output_path` dentro do diretório `terraform/`
+    - _Requirements: 1.2_
+  - [x] 5.2 Declarar `aws_lambda_function` com `runtime = "nodejs24.x"`, `timeout = 300`, `handler = "index.handler"`, `role = aws_iam_role.this.arn`, `logging_config { log_format = "JSON" }` e referência ao `archive_file`
+    - _Requirements: 1.2, 7.4_
+
+- [x] 6. Checkpoint — Validar infraestrutura Terraform
+  - Execute `terraform init` e `terraform validate` no diretório `terraform/` para confirmar que toda a infraestrutura é sintaticamente correta, as validações de variáveis funcionam e não há `aws_secretsmanager_secret_version` declarado. Pergunte ao usuário se tiver dúvidas.
+
+- [x] 7. Criar schemas Zod em `terraform/lambda/rotation/schema.mjs`
+  - [x] 7.1 Criar `package.json` em `terraform/lambda/rotation/` declarando `zod` como dependência com versão exata (ex: `"3.25.67"`) e `"type": "module"`
+    - _Requirements: 3.1_
+  - [x] 7.2 Implementar `schema.mjs` exportando `createKeySchema`, `listKeysSchema` e `deleteKeySchema` conforme especificado no design
+    - `createKeySchema`: `id` string não vazia, `object` literal `"api_key"`, `token` regex `^re_[A-Za-z0-9_]+$` mínimo 10 chars
+    - `listKeysSchema`: `object` string, `has_more` booleano, `data` array com `id`, `name`, `created_at` (ISO 8601)
+    - `deleteKeySchema`: `object` literal `"api_key"`, `id` string não vazia, `deleted` literal `true`
+    - _Requirements: 3.1, 3.2, 3.3_
+
+- [x] 8. Implementar lógica de rotação em `terraform/lambda/rotation/rotation.mjs`
+  - [x] 8.1 Implementar e exportar a função `rotate({ currentKeyToken, oldKeyId, deps })` com verificação de idempotência: se `getCurrentKeyId()` retornar valor igual a `oldKeyId`, encerrar sem efeito colateral
+    - _Requirements: 9.1_
+  - [x] 8.2 Implementar etapa de geração: `POST /api-keys` via `deps.callResendApi` com timeout 10s, validar resposta com `createKeySchema`; abortar ciclo sem modificar AWS se status não 2xx, timeout ou falha Zod
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 3.4, 3.5_
+  - [x] 8.3 Implementar etapa de idempotência parcial: se `currentKeyToken` já for a nova chave (SM atualizado mas revogação pendente), pular geração e ir diretamente para revogação usando `oldKeyId` do Parameter Store
+    - _Requirements: 9.2_
+  - [x] 8.4 Implementar etapa de persistência: `deps.putSecret(secretArn, newKey.token)` e verificar `VersionId` não nulo; abortar sem revogar em caso de falha
+    - _Requirements: 4.1, 4.2, 4.3, 4.4_
+  - [x] 8.5 Implementar etapa de metadados: `deps.putParameter(parameterArn, { new_key_id, old_key_id })`; abortar sem revogar em caso de falha
+    - _Requirements: 5.1, 5.2, 5.3_
+  - [x] 8.6 Implementar etapa de revogação: `DELETE /api-keys/:oldKeyId` com `newKey` como Bearer token, validar com `deleteKeySchema`; HTTP 404 e falha Zod encerram com sucesso + log de aviso, sem reverter escritas AWS
+    - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 9.3, 9.4_
+  - [x] 8.7 Garantir que nenhuma mensagem de log dentro de `rotation.mjs` inclua valores de tokens, payloads brutos ou stack traces; logar apenas nomes de campos, tipos esperados e strings estáticas de progresso
+    - _Requirements: 7.1, 7.5_
+
+- [x] 9. Implementar handler em `terraform/lambda/rotation/index.mjs`
+  - [x] 9.1 Instanciar `SecretsManagerClient` e `SSMClient` do AWS SDK v3 e implementar as funções de I/O concretas (`callResendApi`, `putSecret`, `putParameter`, `getCurrentKeyId`) que serão injetadas em `rotate()`
+    - _Requirements: 2.1, 4.1, 5.1_
+  - [x] 9.2 Implementar `export const handler` que busca `currentKeyToken` via `GetSecretValue` e `oldKeyId` via `GetParameter`, chama `rotate()` com as dependências injetadas, e captura exceções logando apenas `{ error: err.name, step: currentStep }` em JSON antes de relançar
+    - _Requirements: 7.4, 8.1_
+
+- [ ] 10. Escrever testes unitários em `terraform/lambda/rotation/rotation.test.mjs`
+  - [x] 10.1 Implementar testes dos schemas Zod (`schema.mjs`): validação positiva e negativa para `createKeySchema`, `listKeysSchema` e `deleteKeySchema`, cobrindo campos ausentes, tipos errados, literais errados e regex de token inválido
+    - _Requirements: 3.1, 3.2, 3.3_
+  - [x] 10.2 Implementar teste do caminho feliz: nova chave criada, SM atualizado, Parameter Store atualizado, chave antiga revogada — verificar que todas as deps foram chamadas na ordem correta
+    - _Requirements: 2.1, 4.1, 5.1, 6.1_
+  - [x] 10.3 Implementar teste de idempotência completa: `currentKeyId === oldKeyId` → nenhuma dep chamada além de `getCurrentKeyId`
+    - _Requirements: 9.1_
+  - [x] 10.4 Implementar teste de idempotência parcial: SM já atualizado, Parameter Store pendente → pula geração e vai direto para revogação
+    - _Requirements: 9.2_
+  - [x] 10.5 Implementar testes de falha em cada ponto de quebra: falha Zod na criação, `PutSecretValue` lança erro, `PutParameter` lança erro — verificar que `callResendApi(DELETE)` nunca é invocado nestes casos
+    - _Requirements: 2.3, 4.4, 5.3_
+  - [x] 10.6 Implementar testes de falha na revogação: DELETE retorna não 2xx e DELETE retorna 404 — verificar que a função retorna sem erro (sem reverter escritas AWS)
+    - _Requirements: 6.3, 6.4, 9.3_
+
+- [x] 11. Checkpoint — Executar testes e validar Lambda
+  - Execute `node --test terraform/lambda/rotation/rotation.test.mjs` para confirmar que todos os testes passam. Pergunte ao usuário se tiver dúvidas.
+
+- [ ] 12. Criar exemplo de uso em `terraform/examples/basic/`
+  - [-] 12.1 Criar `terraform/examples/basic/main.tf` com bloco `module "nexuskey"` referenciando `../..` e passando valores de exemplo para todas as variáveis obrigatórias e opcionais
+    - _Requirements: 10.3_
+  - [-] 12.2 Criar `terraform/examples/basic/terraform.tfvars.example` com valores sintaticamente válidos para todas as variáveis, de forma que `terraform validate` passe quando usado com o módulo
+    - _Requirements: 10.3_
+  - [ ] 12.3 Criar `terraform/examples/basic/versions.tf` declarando os requisitos de versão para o exemplo
+    - _Requirements: 10.3_
+
+- [~] 13. Checkpoint final — Validar módulo completo
+  - Execute `terraform validate` em `terraform/` e em `terraform/examples/basic/` para confirmar ausência de erros. Confirme que nenhum arquivo `.tf` contém `aws_secretsmanager_secret_version` nem wildcards (`*`) em elementos `Resource` de políticas IAM. Pergunte ao usuário se tiver dúvidas.
+
+## Notes
+
+- Tarefas marcadas com `*` são opcionais e podem ser puladas para um MVP mais rápido
+- O Terraform não deve declarar `aws_secretsmanager_secret_version` em nenhum arquivo — o valor inicial da chave é configurado fora do Terraform
+- As três políticas IAM devem usar ARNs exatos (sem wildcard em `Resource`) — isso é verificado no checkpoint 6 e 13
+- `rotation.mjs` deve ser testável de forma isolada via injeção de dependências; o AWS SDK real só é instanciado em `index.mjs`
+- Todos os logs da Lambda devem seguir a política de não-exposição: nunca logar tokens, payloads brutos ou stack traces
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["1.1", "7.1"] },
+    { "id": 1, "tasks": ["1.2", "1.3", "7.2"] },
+    { "id": 2, "tasks": ["2.1", "2.2", "2.3", "3.1"] },
+    { "id": 3, "tasks": ["3.2", "3.3", "3.4", "4.1", "8.1"] },
+    { "id": 4, "tasks": ["4.2", "5.1", "8.2"] },
+    { "id": 5, "tasks": ["5.2", "8.3", "8.4"] },
+    { "id": 6, "tasks": ["8.5", "8.7"] },
+    { "id": 7, "tasks": ["8.6", "9.1"] },
+    { "id": 8, "tasks": ["9.2"] },
+    { "id": 9, "tasks": ["10.1", "10.2", "10.3", "10.4", "10.5", "10.6"] },
+    { "id": 10, "tasks": ["12.1", "12.2", "12.3"] }
+  ]
+}
+```
