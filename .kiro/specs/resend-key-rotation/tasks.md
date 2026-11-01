@@ -83,7 +83,7 @@ Implementação do módulo NexusKey: infraestrutura Terraform (Secrets Manager, 
   - [x] 9.2 Implementar `export const handler` que busca `currentKeyToken` via `GetSecretValue` e `oldKeyId` via `GetParameter`, chama `rotate()` com as dependências injetadas, e captura exceções logando apenas `{ error: err.name, step: currentStep }` em JSON antes de relançar
     - _Requirements: 7.4, 8.1_
 
-- [ ] 10. Escrever testes unitários em `terraform/lambda/rotation/rotation.test.mjs`
+- [x] 10. Escrever testes unitários em `terraform/lambda/rotation/rotation.test.mjs`
   - [x] 10.1 Implementar testes dos schemas Zod (`schema.mjs`): validação positiva e negativa para `createKeySchema`, `listKeysSchema` e `deleteKeySchema`, cobrindo campos ausentes, tipos errados, literais errados e regex de token inválido
     - _Requirements: 3.1, 3.2, 3.3_
   - [x] 10.2 Implementar teste do caminho feliz: nova chave criada, SM atualizado, Parameter Store atualizado, chave antiga revogada — verificar que todas as deps foram chamadas na ordem correta
@@ -100,16 +100,28 @@ Implementação do módulo NexusKey: infraestrutura Terraform (Secrets Manager, 
 - [x] 11. Checkpoint — Executar testes e validar Lambda
   - Execute `node --test terraform/lambda/rotation/rotation.test.mjs` para confirmar que todos os testes passam. Pergunte ao usuário se tiver dúvidas.
 
-- [ ] 12. Criar exemplo de uso em `terraform/examples/basic/`
-  - [-] 12.1 Criar `terraform/examples/basic/main.tf` com bloco `module "nexuskey"` referenciando `../..` e passando valores de exemplo para todas as variáveis obrigatórias e opcionais
+- [x] 12. Criar exemplo de uso em `terraform/examples/basic/`
+  - [x] 12.1 Criar `terraform/examples/basic/main.tf` com bloco `module "nexuskey"` referenciando `../..` e passando valores de exemplo para todas as variáveis obrigatórias e opcionais
     - _Requirements: 10.3_
-  - [-] 12.2 Criar `terraform/examples/basic/terraform.tfvars.example` com valores sintaticamente válidos para todas as variáveis, de forma que `terraform validate` passe quando usado com o módulo
+  - [x] 12.2 Criar `terraform/examples/basic/terraform.tfvars.example` com valores sintaticamente válidos para todas as variáveis, de forma que `terraform validate` passe quando usado com o módulo
     - _Requirements: 10.3_
-  - [ ] 12.3 Criar `terraform/examples/basic/versions.tf` declarando os requisitos de versão para o exemplo
+  - [x] 12.3 Criar `terraform/examples/basic/versions.tf` declarando os requisitos de versão para o exemplo
     - _Requirements: 10.3_
 
-- [~] 13. Checkpoint final — Validar módulo completo
+- [x] 13. Checkpoint final — Validar módulo completo
   - Execute `terraform validate` em `terraform/` e em `terraform/examples/basic/` para confirmar ausência de erros. Confirme que nenhum arquivo `.tf` contém `aws_secretsmanager_secret_version` nem wildcards (`*`) em elementos `Resource` de políticas IAM. Pergunte ao usuário se tiver dúvidas.
+
+## Pendências
+
+As tasks acima passaram nos testes e no `terraform validate`, mas isso não comprova que a rotação funciona em uso real. Estes problemas seguem sem correção e bloqueiam o uso em produção:
+
+- [ ] `rotation.mjs` não gera chave nova: o estado inicial `{}` é tratado como já rotacionado, e qualquer `new_key_id` com token `re_` válido pula o `POST`. Sem `old_key_id`, o `DELETE` é chamado com ID vazio.
+- [ ] `rotation.mjs` grava o `old_key_id` anterior em vez do ID da chave substituída.
+- [ ] `rotation.test.mjs` usa um token fora do formato `re_` no caminho feliz e não cobre o estado inicial `{}`.
+- [ ] `aws_ssm_parameter.this` não ignora mudanças em `value`: um novo `apply` deve restaurar `{}`.
+- [ ] A Lambda e o IAM usam `var.secret_arn` e `var.parameter_arn`, que podem não ser os recursos criados pelo módulo.
+- [ ] `iam.tf` usa `data.aws_region.current.name`, obsoleto no provider AWS 6.
+- [ ] Conferir na documentação do Resend se `POST /api-keys` exige `name` e se a resposta traz `object: "api_key"`.
 
 ## Notes
 
