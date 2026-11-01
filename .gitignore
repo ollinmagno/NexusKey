@@ -1,0 +1,21 @@
+# Node.js
+node_modules/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Variáveis com valores reais (*.tfvars.example continua versionado)
+*.tfvars
+*.tfvars.json
+
+# Pacote gerado pelo archive_file
+terraform/lambda_rotation.zip
+
+# Histórico de execução do Kiro
+.kiro/specs/*/tasks.meta.json
