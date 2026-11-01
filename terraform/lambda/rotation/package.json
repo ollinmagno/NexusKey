@@ -1,0 +1,10 @@
+{
+  "name": "nexuskey-rotation",
+  "version": "1.0.0",
+  "description": "NexusKey Lambda rotation handler for Resend API key rotation",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "zod": "4.6.7"
+  }
+}
