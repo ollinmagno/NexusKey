@@ -1,0 +1,13 @@
+# Obrigatórias
+secret_arn        = "arn:aws:secretsmanager:us-east-1:123456789012:secret:nexuskey-resend-api-key-AbCdEf"
+parameter_arn     = "arn:aws:ssm:us-east-1:123456789012:parameter/nexuskey-rotation/rotation-metadata"
+rotation_schedule = "rate(7 days)"
+
+# Opcionais (valores padrão mostrados para referência)
+function_name      = "nexuskey-rotation"
+log_retention_days = 30
+tags = {
+  Environment = "production"
+  ManagedBy   = "terraform"
+  Project     = "nexuskey"
+}
