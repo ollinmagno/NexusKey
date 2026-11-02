@@ -3,19 +3,33 @@ node_modules/
 
 # Terraform
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
 crash.log
 crash.*.log
+override.tf
+*_override.tf
 
 # Variáveis com valores reais (*.tfvars.example continua versionado)
 *.tfvars
 *.tfvars.json
 
-# Pacote gerado pelo archive_file
-terraform/lambda_rotation.zip
+# Segredos locais (bootstrap / experimentação)
+.env
+.env.*
+!.env.example
 
-# Histórico de execução do Kiro
+# Pacote gerado pelo archive_file
+terraform/**/*.zip
+
+# Histórico de execução do Kiro (estado atual fica em tasks.md)
 .kiro/specs/*/tasks.meta.json
+
+# Preferências locais do Claude Code (settings.json do projeto continua versionado)
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
