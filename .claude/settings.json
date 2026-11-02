@@ -1,0 +1,14 @@
+{
+  "enabledPlugins": {
+    "aws-core@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "PowerShell(git push *)"
+    ]
+  }
+}
