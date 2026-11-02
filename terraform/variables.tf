@@ -1,46 +1,66 @@
-variable "secret_arn" {
-  description = "ARN do segredo no AWS Secrets Manager onde o token da chave de API ativa é armazenado."
+locals {
+  # Cada spec de serviço acrescenta aqui o nome do seu adaptador.
+  rotation_adapters = ["resend"]
+}
+
+variable "service_name" {
+  description = "Nome do serviço externo, em kebab-case. Dele derivam os nomes de todos os recursos, então cada instância do módulo precisa de um nome próprio."
   type        = string
 
   validation {
-    condition     = length(var.secret_arn) > 0
-    error_message = "A variável 'secret_arn' não pode ser vazia."
+    condition     = can(regex("^[a-z0-9]+(-[a-z0-9]+)*$", var.service_name)) && length(var.service_name) <= 46
+    error_message = "A variável 'service_name' deve estar em kebab-case e ter no máximo 46 caracteres."
   }
 }
 
-variable "parameter_arn" {
-  description = "ARN do parâmetro no AWS Systems Manager Parameter Store onde os metadados de rotação (IDs das chaves) são registrados."
-  type        = string
+variable "enable_rotation" {
+  description = "Cria a Lambda e o agendamento nativo de rotação. Com false, a instância cria só o segredo e a política de leitura."
+  type        = bool
+  default     = false
 
   validation {
-    condition     = length(var.parameter_arn) > 0
-    error_message = "A variável 'parameter_arn' não pode ser vazia."
+    condition     = !var.enable_rotation || var.rotation_schedule != null
+    error_message = "A variável 'rotation_schedule' é obrigatória quando 'enable_rotation' é true."
+  }
+
+  validation {
+    condition     = !var.enable_rotation || contains(local.rotation_adapters, var.service_name)
+    error_message = "A variável 'service_name' não tem adaptador de rotação; use 'enable_rotation = false' ou adicione o adaptador."
   }
 }
 
 variable "rotation_schedule" {
-  description = "Expressão de agendamento do Amazon EventBridge para acionar a rotação. Deve ser uma expressão rate() ou cron() válida (ex: \"rate(7 days)\" ou \"cron(0 3 ? * SUN *)\")."
+  description = "Expressão rate() ou cron() aceita pelo Secrets Manager, por exemplo \"rate(30 days)\". Obrigatória quando 'enable_rotation' é true."
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^(rate|cron)\\(", var.rotation_schedule))
-    error_message = "A variável 'rotation_schedule' recebeu o valor \"${var.rotation_schedule}\", que não é uma expressão válida. Use o formato rate(<valor> <unidade>) ou cron(<expressão>)."
+    condition     = var.rotation_schedule == null || can(regex("^(rate|cron)\\(", var.rotation_schedule))
+    error_message = "A variável 'rotation_schedule' recebeu o valor \"${coalesce(var.rotation_schedule, "null")}\", que não é uma expressão válida. Use rate(<valor> <unidade>) ou cron(<expressão>)."
   }
 }
 
-variable "function_name" {
-  description = "Nome da função AWS Lambda responsável pelo ciclo de rotação. Deve ter no máximo 64 caracteres."
+variable "initial_secret" {
+  description = "JSON inicial do segredo. É efêmero: não fica no state nem no plan. Informe por TF_VAR_initial_secret, nunca em arquivo *.tfvars."
   type        = string
-  default     = "nexuskey-rotation"
+  ephemeral   = true
+  sensitive   = true
+  default     = null
+}
+
+variable "initial_secret_version" {
+  description = "Controla a gravação do valor inicial pelo Terraform: 0 não grava; um número maior grava 'initial_secret'. Não altere depois de uma rotação, pois isso regravaria um valor antigo."
+  type        = number
+  default     = 0
 
   validation {
-    condition     = length(var.function_name) <= 64
-    error_message = "A variável 'function_name' não pode ter mais de 64 caracteres."
+    condition     = var.initial_secret_version >= 0 && floor(var.initial_secret_version) == var.initial_secret_version
+    error_message = "A variável 'initial_secret_version' deve ser um inteiro maior ou igual a 0."
   }
 }
 
 variable "log_retention_days" {
-  description = "Período de retenção dos logs no CloudWatch Logs em dias. Deve ser um dos valores aceitos pelo serviço: 0 (nunca expirar), 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288 ou 3653."
+  description = "Período de retenção dos logs no CloudWatch Logs, em dias. Deve ser um dos valores aceitos pelo serviço: 0 (nunca expirar), 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288 ou 3653."
   type        = number
   default     = 30
 

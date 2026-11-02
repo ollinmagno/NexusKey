@@ -1,18 +1,12 @@
-##############################################################################
-# Data sources — usados para construir ARNs exatos nas políticas inline
-##############################################################################
-
 data "aws_caller_identity" "current" {}
 
 data "aws_region" "current" {}
 
-##############################################################################
-# IAM Role — permite que o serviço Lambda assuma esta role
-##############################################################################
-
 resource "aws_iam_role" "this" {
-  name        = "${var.function_name}-role"
-  description = "Role IAM de execução da Lambda de rotação NexusKey (${var.function_name})"
+  count = local.rotation_count
+
+  name        = "${local.function_name}-role"
+  description = "Role de execução da Lambda ${local.function_name}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -31,61 +25,35 @@ resource "aws_iam_role" "this" {
   tags = var.tags
 }
 
-##############################################################################
-# Política inline — Secrets Manager (GetSecretValue + PutSecretValue)
-##############################################################################
-
 resource "aws_iam_role_policy" "secrets_manager" {
-  name = "${var.function_name}-secrets-manager"
-  role = aws_iam_role.this.id
+  count = local.rotation_count
+
+  name = "${local.function_name}-secrets-manager"
+  role = aws_iam_role.this[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AllowSecretsManagerAccess"
+        Sid    = "AllowSecretRotation"
         Effect = "Allow"
         Action = [
+          "secretsmanager:DescribeSecret",
           "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:UpdateSecretVersionStage"
         ]
-        Resource = [var.secret_arn]
+        Resource = [aws_secretsmanager_secret.this.arn]
       }
     ]
   })
 }
-
-##############################################################################
-# Política inline — SSM Parameter Store (GetParameter + PutParameter)
-##############################################################################
-
-resource "aws_iam_role_policy" "ssm_parameter" {
-  name = "${var.function_name}-ssm-parameter"
-  role = aws_iam_role.this.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowSSMParameterAccess"
-        Effect = "Allow"
-        Action = [
-          "ssm:GetParameter",
-          "ssm:PutParameter"
-        ]
-        Resource = [var.parameter_arn]
-      }
-    ]
-  })
-}
-
-##############################################################################
-# Política inline — CloudWatch Logs (CreateLogGroup + CreateLogStream + PutLogEvents)
-##############################################################################
 
 resource "aws_iam_role_policy" "cloudwatch_logs" {
-  name = "${var.function_name}-cloudwatch-logs"
-  role = aws_iam_role.this.id
+  count = local.rotation_count
+
+  name = "${local.function_name}-cloudwatch-logs"
+  role = aws_iam_role.this[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -99,7 +67,7 @@ resource "aws_iam_role_policy" "cloudwatch_logs" {
           "logs:PutLogEvents"
         ]
         Resource = [
-          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.function_name}:*"
+          "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:${local.log_group_name}:*"
         ]
       }
     ]

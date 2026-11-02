@@ -1,10 +1,16 @@
 # Obrigatórias
-secret_arn        = "arn:aws:secretsmanager:us-east-1:123456789012:secret:nexuskey-resend-api-key-AbCdEf"
-parameter_arn     = "arn:aws:ssm:us-east-1:123456789012:parameter/nexuskey-rotation/rotation-metadata"
-rotation_schedule = "rate(7 days)"
+aws_region   = "us-east-1"
+service_name = "resend"
 
-# Opcionais (valores padrão mostrados para referência)
-function_name      = "nexuskey-rotation"
+# Mantenha 0 até gravar o valor inicial. A chave nunca vai neste arquivo:
+# informe-a em TF_VAR_initial_secret, como descrito no README.
+initial_secret_version = 0
+
+# Ative só depois de a aplicação ler a chave do segredo.
+enable_rotation   = false
+rotation_schedule = "rate(30 days)"
+
+# Opcionais
 log_retention_days = 30
 tags = {
   Environment = "production"
