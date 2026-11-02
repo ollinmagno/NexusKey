@@ -1,10 +1,104 @@
-# Implementation Plan: resend-key-rotation
+# Implementation Plan: api-key-rotation
 
 ## Overview
 
-Implementação do módulo NexusKey: infraestrutura Terraform (Secrets Manager, SSM, IAM, EventBridge, Lambda) + lógica de rotação em Node.js 24.x com validação Zod. O fluxo segue a ordem Gerar → Validar → Persistir → Revogar, com semântica de falha-segura e idempotência.
+Reescreve o núcleo do NexusKey para a rotação nativa do Secrets Manager: um segredo em JSON e uma instância do módulo por serviço, com o que é específico de cada serviço isolado em um adaptador. As tasks 1 a 13 descrevem a arquitetura anterior e estão em `## Substituídas`.
 
 ## Tasks
+
+- [x] 14. Reestruturar a interface do módulo Terraform
+  - [x] 14.1 Reescrever `terraform/variables.tf` com `service_name`, `enable_rotation`, `rotation_schedule`, `initial_secret`, `initial_secret_version`, `log_retention_days`, `tags` e `local.rotation_adapters` vazia, com seus blocos `validation`
+    - _Requirements: 1.3, 9.1, 9.2, 9.5, 9.7_
+  - [x] 14.2 Reescrever `terraform/main.tf` com o segredo, a versão inicial por `secret_string_wo` com `ignore_changes = [version_stages]`, e a política de leitura, removendo o parâmetro SSM e movendo o grupo de logs para `lambda.tf`
+    - _Requirements: 6.2, 9.3, 10.3, 11.1, 11.3_
+  - [x] 14.3 Reescrever `terraform/outputs.tf` com `secret_name`, `secret_arn` sensível, `reader_policy_arn`, `rotate_command` e os outputs condicionais da Lambda
+    - _Requirements: 6.3, 9.7, 10.4, 11.2_
+
+- [x] 15. Tornar a rotação condicional
+  - [x] 15.1 Reescrever `terraform/iam.tf` com `count`, exatamente duas políticas inline e `data.aws_region.current.region`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 9.4_
+  - [x] 15.2 Reescrever `terraform/lambda.tf` com `count`, grupo de logs, `SERVICE_NAME` no ambiente e exclusão dos testes do pacote
+    - _Requirements: 1.2, 9.4, 9.8_
+  - [x] 15.3 Criar `terraform/rotation.tf` com `aws_lambda_permission` e `aws_secretsmanager_secret_rotation`, e apagar `terraform/eventbridge.tf`
+    - _Requirements: 1.1, 7.5, 9.4, 10.1_
+  - [x] 15.4 Reescrever `terraform/examples/basic/` com a região como variável e os novos parâmetros do módulo
+    - _Requirements: 9.6_
+
+- [x] 16. Checkpoint — Validar infraestrutura Terraform
+  - Execute `terraform -chdir=terraform validate` e `terraform -chdir=terraform/examples/basic validate`. Confirme que `terraform/*.tf` não cita SSM, EventBridge nem `parameter_arn`, e que `Resource` só usa o sufixo `:*` do grupo de logs. Pergunte ao usuário se tiver dúvidas.
+
+- [x] 17. Implementar o núcleo da Lambda
+  - [x] 17.1 Criar `terraform/lambda/rotation/adapters/index.mjs` com `getAdapter(serviceName)` e o contrato documentado, inicialmente sem adaptadores
+    - _Requirements: 3.2, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6_
+  - [x] 17.2 Reescrever `terraform/lambda/rotation/rotation.mjs` com a normalização de `Step` e as pré-condições comuns
+    - _Requirements: 1.4, 1.5, 8.2, 8.3_
+  - [x] 17.3 Implementar `createSecret`, com revogação pendente, criação pelo adaptador e gravação em `AWSPENDING`
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 3.1, 3.3, 5.4, 8.1, 10.2_
+  - [x] 17.4 Implementar `setSecret` e `testSecret` pelas operações do adaptador
+    - _Requirements: 4.1, 4.2, 4.3_
+  - [x] 17.5 Implementar `finishSecret`, com promoção e revogação
+    - _Requirements: 4.4, 5.1, 5.2, 5.3, 5.5, 8.4, 8.5_
+  - [x] 17.6 Reescrever `terraform/lambda/rotation/index.mjs` com o I/O real do Secrets Manager e o handler, removendo o SSM e `schema.mjs`
+    - _Requirements: 1.2, 6.1, 6.4_
+
+- [x] 18. Testar o núcleo em `terraform/lambda/rotation/rotation.test.mjs`
+  - [x] 18.1 Criar o Secrets Manager e o adaptador simulados e cobrir o ciclo completo e dois ciclos seguidos
+    - _Requirements: 2.1, 2.3, 2.4, 4.1, 4.2, 4.4, 5.1_
+  - [x] 18.2 Cobrir a reexecução de cada etapa, as interrupções e a nova tentativa de revogação no ciclo seguinte
+    - _Requirements: 2.2, 2.5, 4.3, 5.2, 5.3, 5.4, 8.1, 8.3, 8.4, 8.5_
+  - [x] 18.3 Cobrir `Step` inválido e nas duas formas, rotação desativada, valor inicial inválido, adaptador sem operações opcionais, adaptador inexistente e ausência de segredos nos logs
+    - _Requirements: 1.4, 1.5, 3.1, 3.3, 5.5, 6.1, 6.4, 8.2, 10.2, 12.3, 12.5_
+
+- [x] 19. Checkpoint — Executar testes do núcleo
+  - Execute `node --test terraform/lambda/rotation/rotation.test.mjs` para confirmar que todos os testes passam. Pergunte ao usuário se tiver dúvidas.
+
+- [x] 20. Documentar a operação no `README.md`
+  - [x] 20.1 Descrever a execução local, a sequência de configuração inicial, o alerta sobre a primeira rotação e a recuperação de `AWSPENDING`
+    - _Requirements: 9.8, 10.5, 10.6, 10.7, 10.8_
+  - [x] 20.2 Descrever a leitura pelo SaaS em Node.js, o cache de até 5 minutos e a nova leitura em erro de autenticação
+    - _Requirements: 11.4, 11.5_
+  - [x] 20.3 Descrever como adicionar um serviço e o uso sem rotação
+    - _Requirements: 9.4, 12.7_
+
+- [x] 21. Checkpoint final — Validar o núcleo
+  - Execute `terraform -chdir=terraform validate`, `terraform -chdir=terraform/examples/basic validate` e `node --test terraform/lambda/rotation/rotation.test.mjs`. Revise o código contra os critérios de aceite, percorrendo estado inicial, reexecução e dados no formato real. Pergunte ao usuário se tiver dúvidas.
+
+## Pendências
+
+- [ ] Comprovar em teste real, com a spec `resend-api-key`, o que `testSecret` recebe ao ativar a rotação, se um `apply` depois da rotação não altera `AWSCURRENT`, se `initial_secret` nulo é aceito nos `apply` seguintes, o que ocorre com `initial_secret_version` maior que 0 sem valor informado (o `validate` aceita) e o formato real de `Step`.
+- [x] Conferir em um `plan` com rotação ativa, na spec `resend-api-key`, se o pacote da Lambda contém `zod` e não contém testes. O `plan` passou das validações, e o pacote gerado com as mesmas regras de exclusão, extraído, contém `zod` 4.6.7, carrega o adaptador e não contém testes.
+
+## Notes
+
+- A ordem é núcleo, depois `resend-api-key`.
+- A numeração começa em 14 porque o título completo é a chave do histórico de execução.
+- Nenhum valor de credencial pode aparecer em código, logs, outputs, state ou exemplos.
+- Testes verdes e `terraform validate` não comprovam o comportamento na AWS.
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["14.1"] },
+    { "id": 1, "tasks": ["14.2", "14.3", "15.1"] },
+    { "id": 2, "tasks": ["15.2", "15.3"] },
+    { "id": 3, "tasks": ["15.4"] },
+    { "id": 4, "tasks": ["17.1"] },
+    { "id": 5, "tasks": ["17.2"] },
+    { "id": 6, "tasks": ["17.3", "17.4", "17.5"] },
+    { "id": 7, "tasks": ["17.6"] },
+    { "id": 8, "tasks": ["18.1"] },
+    { "id": 9, "tasks": ["18.2", "18.3"] },
+    { "id": 10, "tasks": ["20.1", "20.2", "20.3"] }
+  ]
+}
+```
+
+## Substituídas
+
+Tasks e pendências da arquitetura anterior, mantidas como registro. Elas não fazem mais parte do plano, e as referências a requisitos usam a numeração antiga.
+
 
 - [x] 1. Criar estrutura base do módulo Terraform
   - [x] 1.1 Criar `terraform/versions.tf` com bloco `terraform { required_version }` fixando Terraform 1.17.1 e bloco `required_providers` com `aws >= 6.0, < 7.0`
@@ -111,7 +205,7 @@ Implementação do módulo NexusKey: infraestrutura Terraform (Secrets Manager, 
 - [x] 13. Checkpoint final — Validar módulo completo
   - Execute `terraform validate` em `terraform/` e em `terraform/examples/basic/` para confirmar ausência de erros. Confirme que nenhum arquivo `.tf` contém `aws_secretsmanager_secret_version` nem wildcards (`*`) em elementos `Resource` de políticas IAM. Pergunte ao usuário se tiver dúvidas.
 
-## Pendências
+### Pendências antigas
 
 As tasks acima passaram nos testes e no `terraform validate`, mas isso não comprova que a rotação funciona em uso real. Estes problemas seguem sem correção e bloqueiam o uso em produção:
 
@@ -122,31 +216,3 @@ As tasks acima passaram nos testes e no `terraform validate`, mas isso não comp
 - [ ] A Lambda e o IAM usam `var.secret_arn` e `var.parameter_arn`, que podem não ser os recursos criados pelo módulo.
 - [ ] `iam.tf` usa `data.aws_region.current.name`, obsoleto no provider AWS 6.
 - [ ] Conferir na documentação do Resend se `POST /api-keys` exige `name` e se a resposta traz `object: "api_key"`.
-
-## Notes
-
-- Tarefas marcadas com `*` são opcionais e podem ser puladas para um MVP mais rápido
-- O Terraform não deve declarar `aws_secretsmanager_secret_version` em nenhum arquivo — o valor inicial da chave é configurado fora do Terraform
-- As três políticas IAM devem usar ARNs exatos (sem wildcard em `Resource`) — isso é verificado no checkpoint 6 e 13
-- `rotation.mjs` deve ser testável de forma isolada via injeção de dependências; o AWS SDK real só é instanciado em `index.mjs`
-- Todos os logs da Lambda devem seguir a política de não-exposição: nunca logar tokens, payloads brutos ou stack traces
-
-## Task Dependency Graph
-
-```json
-{
-  "waves": [
-    { "id": 0, "tasks": ["1.1", "7.1"] },
-    { "id": 1, "tasks": ["1.2", "1.3", "7.2"] },
-    { "id": 2, "tasks": ["2.1", "2.2", "2.3", "3.1"] },
-    { "id": 3, "tasks": ["3.2", "3.3", "3.4", "4.1", "8.1"] },
-    { "id": 4, "tasks": ["4.2", "5.1", "8.2"] },
-    { "id": 5, "tasks": ["5.2", "8.3", "8.4"] },
-    { "id": 6, "tasks": ["8.5", "8.7"] },
-    { "id": 7, "tasks": ["8.6", "9.1"] },
-    { "id": 8, "tasks": ["9.2"] },
-    { "id": 9, "tasks": ["10.1", "10.2", "10.3", "10.4", "10.5", "10.6"] },
-    { "id": 10, "tasks": ["12.1", "12.2", "12.3"] }
-  ]
-}
-```
