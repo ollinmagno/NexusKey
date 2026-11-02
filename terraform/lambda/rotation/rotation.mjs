@@ -1,125 +1,147 @@
 /**
- * rotation.mjs — Lógica de rotação da chave Resend (injeção de dependências)
+ * Etapas da rotação nativa do Secrets Manager, independentes do serviço externo.
+ * O I/O com a AWS é injetado em `deps`, e o específico do serviço fica em `adapter`.
  *
- * Todas as operações de I/O (AWS SDK, Resend API) são recebidas via `deps`,
- * tornando este módulo testável de forma isolada sem SDK real nem rede.
- *
- * Fluxo: Verificar Idempotência → Gerar → Validar → Persistir → Revogar
- * Qualquer falha antes da revogação preserva a chave antiga intacta.
+ * deps:
+ *   describe(secretId)                         { RotationEnabled, VersionIdsToStages }
+ *   getValue(secretId, { versionId?, stage })  string, ou null se a versão não tiver valor
+ *   putPending(secretId, token, value)         { VersionId }
+ *   promote(secretId, token, currentVersionId) move AWSCURRENT para `token`
  */
 
-import { createKeySchema, deleteKeySchema } from "./schema.mjs"
+const STEPS = {
+  createSecret: "createSecret",
+  create_secret: "createSecret",
+  setSecret: "setSecret",
+  set_secret: "setSecret",
+  testSecret: "testSecret",
+  test_secret: "testSecret",
+  finishSecret: "finishSecret",
+  finish_secret: "finishSecret",
+}
+
+const CURRENT = "AWSCURRENT"
+const PENDING = "AWSPENDING"
+const PREVIOUS = "AWSPREVIOUS"
+
+function findVersion(versions, stage) {
+  return Object.keys(versions).find((id) => versions[id].includes(stage))
+}
+
+export async function rotate({ event, adapter, deps, log = console }) {
+  const step = STEPS[event?.Step]
+  if (!step) throw new Error("Unknown rotation step")
+
+  const { SecretId: secretId, ClientRequestToken: token } = event
+  const info = (result) => log.info(JSON.stringify({ step, result }))
+
+  const parse = (value) => {
+    const result = adapter.secretSchema.safeParse(value)
+    if (!result.success) {
+      const issues = result.error.issues.map((i) => ({ field: i.path.join("."), code: i.code }))
+      log.error(JSON.stringify({ step, result: "invalid-secret", issues }))
+      throw new Error("Secret value failed schema validation")
+    }
+    return result.data
+  }
+
+  const readSecret = async (selector) => {
+    const raw = await deps.getValue(secretId, selector)
+    if (raw === null) throw new Error("Secret version has no value")
+    let value
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      // A mensagem original do JSON.parse pode reproduzir parte do valor.
+      log.error(JSON.stringify({ step, result: "invalid-secret", code: "invalid_json" }))
+      throw new Error("Secret value is not valid JSON")
+    }
+    return parse(value)
+  }
+
+  const revokePrevious = async (versions, current) => {
+    if (!adapter.revoke || !findVersion(versions, PREVIOUS)) return
+    const raw = await deps.getValue(secretId, { stage: PREVIOUS })
+    if (raw === null) return
+    const previous = await readSecret({ stage: PREVIOUS })
+    // Regravar o mesmo valor deixa AWSPREVIOUS igual à credencial em uso, que não pode ser revogada.
+    if (JSON.stringify(previous) === JSON.stringify(current)) {
+      info("previous-equals-current")
+      return
+    }
+    info(`previous-${await adapter.revoke({ previous, current })}`)
+  }
+
+  const { RotationEnabled, VersionIdsToStages: versions = {} } = await deps.describe(secretId)
+  if (!RotationEnabled) throw new Error("Rotation is not enabled for this secret")
+
+  const stages = versions[token]
+  if (!stages) throw new Error("Unknown rotation token")
+
+  const isCurrent = stages.includes(CURRENT)
+  if (!isCurrent && !stages.includes(PENDING)) throw new Error("Version is not pending rotation")
+
+  if (step !== "finishSecret" && isCurrent) {
+    info("already-current")
+    return
+  }
+
+  if (step === "createSecret") {
+    if ((await deps.getValue(secretId, { versionId: token, stage: PENDING })) !== null) {
+      info("already-created")
+      return
+    }
+    const current = await readSecret({ stage: CURRENT })
+    await revokePrevious(versions, current)
+    const value = parse(await adapter.create({ current, now: new Date() }))
+    const { VersionId } = await deps.putPending(secretId, token, JSON.stringify(value))
+    if (!VersionId) throw new Error("PutSecretValue returned no VersionId")
+    info("created")
+    return
+  }
+
+  if (step === "setSecret") {
+    if (!adapter.set) {
+      info("skipped")
+      return
+    }
+    await adapter.set({
+      pending: await readSecret({ versionId: token, stage: PENDING }),
+      current: await readSecret({ stage: CURRENT }),
+    })
+    info("set")
+    return
+  }
+
+  if (step === "testSecret") {
+    await adapter.test({ pending: await readSecret({ versionId: token, stage: PENDING }) })
+    info("tested")
+    return
+  }
+
+  let latest = versions
+  if (!isCurrent) {
+    await deps.promote(secretId, token, findVersion(versions, CURRENT))
+    latest = (await deps.describe(secretId)).VersionIdsToStages ?? {}
+    if (!latest[token]?.includes(CURRENT)) throw new Error("Promotion could not be confirmed")
+    info("promoted")
+  }
+  await revokePrevious(latest, await readSecret({ stage: CURRENT }))
+  info("finished")
+}
 
 /**
- * Executa o ciclo de rotação da chave de API do Resend.
- *
- * @param {object} params
- * @param {string} params.currentKeyToken - Token da chave atualmente ativa no Secrets Manager.
- * @param {string} params.oldKeyId        - ID da chave registrado no Parameter Store como "a ser revogada".
- * @param {string} params.secretArn       - ARN do segredo no Secrets Manager onde o novo token será persistido.
- * @param {string} params.parameterArn    - ARN do parâmetro no Parameter Store onde os metadados serão registrados.
- * @param {object} params.deps            - Dependências de I/O injetadas.
- * @param {Function} params.deps.callResendApi   - (method, path, bearerToken, body?) → { status, data }
- * @param {Function} params.deps.putSecret       - (secretArn, value) → { VersionId }
- * @param {Function} params.deps.putParameter    - (parameterArn, value) → void
- * @param {Function} params.deps.getCurrentKeyId - () → string (id da chave ativa no SM)
+ * Ponto de entrada testável. A exceção relançada não carrega a original, porque
+ * o runtime da Lambda registra mensagem e stack de todo erro que recebe.
  */
-export async function rotate({ currentKeyToken, oldKeyId, secretArn, parameterArn, deps }) {
-  const { callResendApi, putSecret, putParameter, getCurrentKeyId } = deps
-
-  // Etapa 1: Verificação de idempotência completa
-  // Se o id da chave atualmente ativa no SM é igual a oldKeyId, a rotação
-  // anterior já foi concluída — encerrar sem nenhum efeito colateral.
-  const currentKeyId = await getCurrentKeyId()
-  if (currentKeyId === oldKeyId) {
-    console.info(JSON.stringify({ step: "idempotency-check", result: "already-rotated" }))
-    return
-  }
-
-  // Idempotência parcial: verifica se o SM já foi atualizado com a nova chave
-  // (execução anterior salvou a nova chave mas travou antes de revogar a antiga)
-  // Se currentKeyToken já é uma chave válida e diferente da oldKeyId,
-  // o SM foi atualizado — pular geração e ir direto para revogação.
-  let newKey
-
-  const partialIdempotency = currentKeyId !== oldKeyId
-    && createKeySchema.safeParse({ id: currentKeyId, object: "api_key", token: currentKeyToken }).success
-
-  if (partialIdempotency) {
-    // SM já tem a nova chave — reconstruir newKey a partir do que sabemos
-    // e pular diretamente para a revogação
-    newKey = { id: currentKeyId, object: "api_key", token: currentKeyToken }
-    console.info(JSON.stringify({ step: "partial-idempotency", result: "skipping-generation" }))
-  } else {
-    // Etapa 2: Gerar nova chave via POST /api-keys
-    const createResponse = await callResendApi("POST", "/api-keys", currentKeyToken)
-
-    if (createResponse.status < 200 || createResponse.status >= 300) {
-      throw new Error(`Key creation failed with HTTP status: ${createResponse.status}`)
-    }
-
-    const createResult = createKeySchema.safeParse(createResponse.data)
-    if (!createResult.success) {
-      // Req 7.1, 7.5: log only field path and error code — never i.message, which
-      // could embed the expected literal value and risks leaking schema internals.
-      // i.code is a static machine-readable constant (e.g. "invalid_type", "too_small").
-      const issues = createResult.error.issues.map(i => ({ field: i.path.join("."), code: i.code }))
-      console.error(JSON.stringify({ step: "validate-create", issues }))
-      throw new Error("Key creation response failed schema validation")
-    }
-
-    newKey = createResult.data
-  }
-
-  // Etapa 3: Persistir novo token no Secrets Manager
-  // Somente avançar para revogação se PutSecretValue retornar VersionId não nulo.
-  const putSecretResult = await putSecret(secretArn, newKey.token)
-  if (!putSecretResult?.VersionId) {
-    throw new Error("PutSecretValue returned no VersionId — aborting before revocation")
-  }
-  console.info(JSON.stringify({ step: "put-secret", result: "success" }))
-
-  // Etapa 4: Persistir metadados no Parameter Store
-  // IMPORTANTE: apenas IDs são armazenados — nunca o valor do token.
-  // Req 5.2: Parameter Store não deve receber campos `token` de nenhuma das chaves.
-  await putParameter(parameterArn, JSON.stringify({
-    new_key_id: newKey.id,
-    old_key_id: oldKeyId,
-  }))
-  console.info(JSON.stringify({ step: "put-parameter", result: "success" }))
-
-  // Etapa 5: Revogar chave antiga via DELETE /api-keys/:oldKeyId
-  // Usa newKey.token como Bearer (a chave válida atual) e oldKeyId como alvo.
-  // Falha aqui NÃO reverte escritas AWS — é uma falha suave com log de aviso.
-  let deleteResponse
+export async function handleEvent({ event, serviceName, getAdapter, deps, log = console }) {
+  const step = STEPS[event?.Step] ?? "unknown"
   try {
-    deleteResponse = await callResendApi("DELETE", `/api-keys/${oldKeyId}`, newKey.token)
+    await rotate({ event, adapter: getAdapter(serviceName), deps, log })
   } catch (err) {
-    // Timeout de rede ou erro — log de aviso, encerrar com sucesso (escritas AWS estão confirmadas)
-    console.warn(JSON.stringify({ step: "revoke-old-key", result: "network-error", error: err.name }))
-    return
+    log.error(JSON.stringify({ error: err?.name ?? "Error", step }))
+    const failure = new Error(`Rotation failed at step ${step}`)
+    failure.name = "RotationError"
+    throw failure
   }
-
-  // HTTP 404 = chave já revogada (idempotente) — sucesso
-  if (deleteResponse.status === 404) {
-    console.warn(JSON.stringify({ step: "revoke-old-key", result: "already-revoked" }))
-    return
-  }
-
-  // Resposta não-2xx (exceto 404) — log de aviso, encerrar com sucesso
-  if (deleteResponse.status < 200 || deleteResponse.status >= 300) {
-    console.warn(JSON.stringify({ step: "revoke-old-key", result: "unexpected-status", status: deleteResponse.status }))
-    return
-  }
-
-  // Validar schema da resposta de deleção
-  const deleteResult = deleteKeySchema.safeParse(deleteResponse.data)
-  if (!deleteResult.success) {
-    const issues = deleteResult.error.issues.map(i => ({ field: i.path.join("."), code: i.code }))
-    console.warn(JSON.stringify({ step: "revoke-old-key", result: "schema-invalid", issues }))
-    return
-  }
-
-  console.info(JSON.stringify({ step: "revoke-old-key", result: "success" }))
-  // Função encerra aqui — rotação completa
 }

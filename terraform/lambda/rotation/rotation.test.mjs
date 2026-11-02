@@ -1,355 +1,502 @@
-﻿import { test, describe } from "node:test"
-import assert from "node:assert/strict"
-import { createKeySchema, listKeysSchema, deleteKeySchema } from "./schema.mjs"
-import { rotate } from "./rotation.mjs"
+﻿import assert from "node:assert/strict"
+import { beforeEach, describe, test } from "node:test"
+import { z } from "zod"
+import { getAdapter } from "./adapters/index.mjs"
+import { handleEvent, rotate } from "./rotation.mjs"
+import { FakeSecretsManager } from "./test-support/fake-secrets-manager.mjs"
 
-describe("Schema validation", () => {
-  describe("createKeySchema", () => {
-    test("accepts valid payload", () => {
-      const result = createKeySchema.safeParse({
-        id: "key_abc123",
-        object: "api_key",
-        token: "re_AbCdEf1234",
-      })
-      assert.equal(result.success, true)
+const SECRET_ID = "arn:aws:secretsmanager:us-east-1:123456789012:secret:nexuskey/fake-AbCdEf"
+const STEPS = ["createSecret", "setSecret", "testSecret", "finishSecret"]
+
+/** Serviço externo simulado: registra credenciais ativas e chamadas. */
+class FakeService {
+  active = new Set(["cred-0"])
+  revoked = []
+  created = 0
+  fail = {}
+  calls = []
+
+  adapter(options = {}) {
+    const base = {
+      secretSchema: z.object({ api_key: z.string().min(5), key_id: z.string().min(1) }),
+      create: async ({ current }) => {
+        this.calls.push("create")
+        if (this.fail.create) throw new Error("create failed")
+        if (!this.active.has(current.key_id)) throw new Error("credential revoked")
+        this.created += 1
+        const id = `cred-${this.created}`
+        this.active.add(id)
+        return options.invalidCreate ? { key_id: id } : { api_key: `secret-${id}`, key_id: id }
+      },
+      test: async ({ pending }) => {
+        this.calls.push("test")
+        if (this.fail.test) throw new Error("test failed")
+        if (!this.active.has(pending.key_id)) throw new Error("credential invalid")
+      },
+      revoke: async ({ previous }) => {
+        this.calls.push("revoke")
+        if (this.fail.revoke) throw new Error("revoke failed")
+        if (!this.active.delete(previous.key_id)) return "already-revoked"
+        this.revoked.push(previous.key_id)
+        return "revoked"
+      },
+    }
+    if (options.withoutRevoke) delete base.revoke
+    if (options.set) base.set = options.set
+    return base
+  }
+}
+
+const silent = { info() {}, warn() {}, error() {} }
+const initial = { api_key: "secret-cred-0", key_id: "cred-0" }
+
+describe("rotação", () => {
+  let sm
+  let service
+
+  const step = (Step, token, adapter = service.adapter(), log = silent) =>
+    rotate({
+      event: { Step, SecretId: SECRET_ID, ClientRequestToken: token },
+      adapter,
+      deps: sm.deps,
+      log,
     })
 
-    test("rejects missing id", () => {
-      const result = createKeySchema.safeParse({ object: "api_key", token: "re_AbCdEf1234" })
-      assert.equal(result.success, false)
+  const cycle = async (token, adapter) => {
+    sm.startRotation(token)
+    for (const name of STEPS) await step(name, token, adapter)
+  }
+
+  beforeEach(() => {
+    sm = new FakeSecretsManager()
+    service = new FakeService()
+    sm.seed(initial)
+  })
+
+  describe("ciclo completo", () => {
+    test("promove a nova credencial e revoga a anterior", async () => {
+      await cycle("token-1")
+
+      assert.deepEqual(sm.valueAt("AWSCURRENT"), { api_key: "secret-cred-1", key_id: "cred-1" })
+      assert.deepEqual(sm.valueAt("AWSPREVIOUS"), initial)
+      assert.deepEqual(service.revoked, ["cred-0"])
+      assert.deepEqual([...service.active], ["cred-1"])
     })
 
-    test("rejects wrong object literal", () => {
-      const result = createKeySchema.safeParse({ id: "k1", object: "wrong", token: "re_AbCdEf1234" })
-      assert.equal(result.success, false)
+    test("segue a ordem criar, gravar, testar, promover e revogar em ciclos seguidos", async () => {
+      const order = []
+      const { putPending, promote } = sm.deps
+      sm.deps.putPending = async (...args) => (order.push("put"), putPending(...args))
+      sm.deps.promote = async (...args) => (order.push("promote"), promote(...args))
+      const adapter = service.adapter()
+      for (const name of ["create", "test", "revoke"]) {
+        const original = adapter[name]
+        adapter[name] = async (args) => (order.push(name), original(args))
+      }
+
+      await cycle("token-1", adapter)
+      assert.deepEqual(order, ["create", "put", "test", "promote", "revoke"])
+
+      order.length = 0
+      await cycle("token-2", adapter)
+      assert.deepEqual(order, ["revoke", "create", "put", "test", "promote", "revoke"])
     })
 
-    test("rejects token not matching regex", () => {
-      const result = createKeySchema.safeParse({ id: "k1", object: "api_key", token: "invalid_token" })
-      assert.equal(result.success, false)
+    test("testa a credencial pendente, não a atual", async () => {
+      const tested = []
+      const adapter = service.adapter()
+      adapter.test = async ({ pending }) => tested.push(pending.key_id)
+      await cycle("token-1", adapter)
+      assert.deepEqual(tested, ["cred-1"])
     })
 
-    test("rejects token shorter than 10 chars", () => {
-      const result = createKeySchema.safeParse({ id: "k1", object: "api_key", token: "re_short" })
-      assert.equal(result.success, false)
+    test("dois ciclos seguidos revogam a credencial certa em cada um", async () => {
+      await cycle("token-1")
+      await cycle("token-2")
+
+      assert.deepEqual(sm.valueAt("AWSCURRENT").key_id, "cred-2")
+      assert.deepEqual(sm.valueAt("AWSPREVIOUS").key_id, "cred-1")
+      assert.deepEqual(service.revoked, ["cred-0", "cred-1"])
+      assert.deepEqual([...service.active], ["cred-2"])
+      assert.equal(service.created, 2)
+    })
+
+    test("a credencial só muda para as aplicações em finishSecret", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await step("setSecret", "token-1")
+      await step("testSecret", "token-1")
+      assert.deepEqual(sm.valueAt("AWSCURRENT"), initial)
+      assert.deepEqual(service.revoked, [])
     })
   })
 
-  describe("listKeysSchema", () => {
-    test("accepts valid payload", () => {
-      const result = listKeysSchema.safeParse({
-        object: "list",
-        has_more: false,
-        data: [{ id: "k1", name: "My Key", created_at: "2024-01-01T00:00:00Z" }],
-      })
-      assert.equal(result.success, true)
+  describe("reexecução", () => {
+    test("createSecret repetido não cria outra credencial", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await step("createSecret", "token-1")
+      assert.equal(service.created, 1)
+      assert.equal(sm.calls.filter((c) => c === "putPending").length, 1)
     })
 
-    test("accepts empty data array", () => {
-      const result = listKeysSchema.safeParse({ object: "list", has_more: false, data: [] })
-      assert.equal(result.success, true)
+    test("etapas repetidas depois da promoção não têm efeito", async () => {
+      await cycle("token-1")
+      service.calls.length = 0
+      sm.calls.length = 0
+      await step("createSecret", "token-1")
+      await step("setSecret", "token-1")
+      await step("testSecret", "token-1")
+      assert.deepEqual(service.calls, [])
+      assert.deepEqual(sm.calls, [])
     })
 
-    test("rejects non-boolean has_more", () => {
-      const result = listKeysSchema.safeParse({ object: "list", has_more: "false", data: [] })
-      assert.equal(result.success, false)
+    test("finishSecret repetido não promove de novo e conclui com a revogação feita", async () => {
+      await cycle("token-1")
+      sm.calls.length = 0
+      await step("finishSecret", "token-1")
+      assert.deepEqual(sm.calls, [])
+      assert.deepEqual(service.revoked, ["cred-0"])
     })
 
-    test("rejects invalid created_at format", () => {
-      const result = listKeysSchema.safeParse({
-        object: "list",
-        has_more: false,
-        data: [{ id: "k1", name: "n", created_at: "not-a-date" }],
-      })
-      assert.equal(result.success, false)
+    test("o ciclo inteiro repetido com o mesmo token não duplica nada", async () => {
+      await cycle("token-1")
+      for (const name of STEPS) await step(name, "token-1")
+      assert.equal(service.created, 1)
+      assert.deepEqual(service.revoked, ["cred-0"])
     })
 
-    test("rejects missing data field", () => {
-      const result = listKeysSchema.safeParse({ object: "list", has_more: false })
-      assert.equal(result.success, false)
+    test("setSecret repetido executa a operação do adaptador de forma segura", async () => {
+      const seen = []
+      const adapter = service.adapter({ set: async ({ pending }) => seen.push(pending.key_id) })
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1", adapter)
+      await step("setSecret", "token-1", adapter)
+      await step("setSecret", "token-1", adapter)
+      assert.deepEqual(seen, ["cred-1", "cred-1"])
+    })
+  })
+
+  describe("interrupção", () => {
+    test("falha ao criar não grava nada", async () => {
+      service.fail.create = true
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("createSecret", "token-1"), /create failed/)
+      assert.deepEqual(sm.calls, [])
+      assert.deepEqual(sm.valueAt("AWSCURRENT"), initial)
+    })
+
+    test("falha na gravação mantém AWSCURRENT e permite recomeçar", async () => {
+      sm.fail.putPending = true
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("createSecret", "token-1"), /PutSecretValue/)
+      assert.deepEqual(sm.valueAt("AWSCURRENT"), initial)
+
+      sm.fail.putPending = false
+      await step("createSecret", "token-1")
+      assert.equal(sm.valueAt("AWSPENDING").key_id, "cred-2", "a primeira credencial fica órfã: risco documentado")
+    })
+
+    test("gravação sem VersionId encerra com erro", async () => {
+      sm.fail.noVersionId = true
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("createSecret", "token-1"), /VersionId/)
+    })
+
+    test("teste com falha mantém AWSCURRENT e não revoga", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      service.fail.test = true
+      await assert.rejects(() => step("testSecret", "token-1"), /test failed/)
+      assert.deepEqual(sm.valueAt("AWSCURRENT"), initial)
+      assert.deepEqual(service.revoked, [])
+    })
+
+    test("promoção sem confirmação não revoga", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      sm.deps.promote = async () => {}
+      await assert.rejects(() => step("finishSecret", "token-1"), /could not be confirmed/)
+      assert.deepEqual(service.revoked, [])
+      assert.equal(service.calls.includes("revoke"), false)
+    })
+
+    test("promoção com falha não revoga, e a repetição conclui", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await step("testSecret", "token-1")
+      sm.fail.promote = true
+      await assert.rejects(() => step("finishSecret", "token-1"), /UpdateSecretVersionStage/)
+      assert.deepEqual(service.revoked, [])
+
+      sm.fail.promote = false
+      await step("finishSecret", "token-1")
+      assert.equal(sm.valueAt("AWSCURRENT").key_id, "cred-1")
+      assert.deepEqual(service.revoked, ["cred-0"])
     })
   })
 
-  describe("deleteKeySchema", () => {
-    test("accepts valid payload", () => {
-      const result = deleteKeySchema.safeParse({ object: "api_key", id: "k1", deleted: true })
-      assert.equal(result.success, true)
+  describe("revogação", () => {
+    test("falha encerra com erro sem reverter a promoção", async () => {
+      service.fail.revoke = true
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await assert.rejects(() => step("finishSecret", "token-1"), /revoke failed/)
+      assert.equal(sm.valueAt("AWSCURRENT").key_id, "cred-1")
     })
 
-    test("rejects deleted: false", () => {
-      const result = deleteKeySchema.safeParse({ object: "api_key", id: "k1", deleted: false })
-      assert.equal(result.success, false)
+    test("a repetição de finishSecret tenta revogar de novo", async () => {
+      service.fail.revoke = true
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await assert.rejects(() => step("finishSecret", "token-1"))
+
+      service.fail.revoke = false
+      await step("finishSecret", "token-1")
+      assert.deepEqual(service.revoked, ["cred-0"])
     })
 
-    test("rejects wrong object literal", () => {
-      const result = deleteKeySchema.safeParse({ object: "other", id: "k1", deleted: true })
-      assert.equal(result.success, false)
+    test("o ciclo seguinte recupera a revogação perdida antes de criar", async () => {
+      service.fail.revoke = true
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await assert.rejects(() => step("finishSecret", "token-1"))
+      service.fail.revoke = false
+      service.calls.length = 0
+
+      sm.startRotation("token-2")
+      await step("createSecret", "token-2")
+
+      assert.deepEqual(service.revoked, ["cred-0"])
+      assert.deepEqual(service.calls, ["revoke", "create"])
     })
 
-    test("rejects missing id", () => {
-      const result = deleteKeySchema.safeParse({ object: "api_key", deleted: true })
-      assert.equal(result.success, false)
+    test("falha na revogação pendente impede criar outra credencial", async () => {
+      service.fail.revoke = true
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      await assert.rejects(() => step("finishSecret", "token-1"))
+      const created = service.created
+
+      sm.startRotation("token-2")
+      await assert.rejects(() => step("createSecret", "token-2"), /revoke failed/)
+      assert.equal(service.created, created)
+      assert.equal(sm.valueAt("AWSPENDING"), null)
+    })
+
+    test("credencial já revogada conclui com sucesso", async () => {
+      service.active.delete("cred-0")
+      service.active.add("cred-0-copy")
+      sm.seed({ api_key: "secret-cred-x", key_id: "cred-0-copy" }, "v-other")
+      sm.versions.get("v-initial").stages.clear()
+      sm.moveStage("AWSPREVIOUS", "v-initial")
+      await cycle("token-1")
+      assert.equal(sm.valueAt("AWSCURRENT").key_id, "cred-1")
+    })
+
+    test("AWSPREVIOUS igual à credencial em uso nunca é revogado", async () => {
+      sm.seed(initial, "v-copy")
+      sm.versions.get("v-initial").stages.clear()
+      sm.moveStage("AWSPREVIOUS", "v-initial")
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      assert.deepEqual(service.revoked, [])
+      assert.equal(service.calls.includes("revoke"), false)
+    })
+
+    test("adaptador sem revogação conclui sem tentar revogar", async () => {
+      const adapter = service.adapter({ withoutRevoke: true })
+      await cycle("token-1", adapter)
+      await cycle("token-2", adapter)
+      assert.equal(sm.valueAt("AWSCURRENT").key_id, "cred-2")
+      assert.deepEqual(service.revoked, [])
     })
   })
-})
 
-describe("rotate â€” revocation failures are soft", () => {
-  const buildSuccessfulDeps = (deleteStatus) => {
-    const calls = []
-    return {
-      calls,
-      deps: {
-        getCurrentKeyId: async () => "some_other_id",
-        callResendApi: async (method, path) => {
-          calls.push(`${method}:${path}`)
-          if (method === "POST") {
-            return { status: 201, data: { id: "new_k", object: "api_key", token: "re_NewToken12345" } }
-          }
-          return { status: deleteStatus, data: {} }
+  describe("operações opcionais", () => {
+    test("setSecret não faz nada sem a operação", async () => {
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1")
+      service.calls.length = 0
+      await step("setSecret", "token-1")
+      assert.deepEqual(service.calls, [])
+    })
+
+    test("setSecret usa a operação do adaptador com a credencial pendente e a atual", async () => {
+      let received
+      const adapter = service.adapter({ set: async (args) => (received = args) })
+      sm.startRotation("token-1")
+      await step("createSecret", "token-1", adapter)
+      await step("setSecret", "token-1", adapter)
+      assert.equal(received.pending.key_id, "cred-1")
+      assert.equal(received.current.key_id, "cred-0")
+    })
+  })
+
+  describe("pré-condições", () => {
+    test("Step inválido encerra sem efeito colateral", async () => {
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("deleteSecret", "token-1"), /Unknown rotation step/)
+      assert.deepEqual(service.calls, [])
+    })
+
+    for (const [form, name] of [
+      ["create_secret", "createSecret"],
+      ["set_secret", "setSecret"],
+      ["test_secret", "testSecret"],
+      ["finish_secret", "finishSecret"],
+    ]) {
+      test(`${form} equivale a ${name}`, async () => {
+        sm.startRotation("token-1")
+        await step("create_secret", "token-1")
+        await step(form, "token-1")
+        assert.equal(service.created, 1)
+      })
+    }
+
+    test("rotação desativada encerra sem efeito colateral", async () => {
+      sm.rotationEnabled = false
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("createSecret", "token-1"), /not enabled/)
+      assert.deepEqual(service.calls, [])
+    })
+
+    test("token desconhecido encerra sem efeito colateral", async () => {
+      await assert.rejects(() => step("createSecret", "token-x"), /Unknown rotation token/)
+      assert.deepEqual(service.calls, [])
+    })
+
+    test("versão fora de AWSPENDING encerra sem efeito colateral", async () => {
+      await cycle("token-1")
+      service.calls.length = 0
+      assert.deepEqual(sm.stageOf("v-initial"), ["AWSPREVIOUS"])
+      await assert.rejects(() => step("createSecret", "v-initial"), /not pending/)
+      assert.deepEqual(service.calls, [])
+    })
+  })
+
+  describe("valor inicial", () => {
+    const invalidCases = [
+      ["ausente", null],
+      ["sem o identificador", JSON.stringify({ api_key: "secret-cred-0" })],
+      ["com JSON inválido", "secret-sem-json"],
+    ]
+
+    for (const [name, value] of invalidCases) {
+      test(`${name} não chama o serviço nem grava`, async () => {
+        sm.versions.get("v-initial").value = value
+        sm.startRotation("token-1")
+        await assert.rejects(() => step("createSecret", "token-1"))
+        assert.deepEqual(service.calls, [])
+        assert.deepEqual(sm.calls, [])
+      })
+    }
+
+    test("valor criado fora do schema não é gravado", async () => {
+      sm.startRotation("token-1")
+      await assert.rejects(
+        () => step("createSecret", "token-1", service.adapter({ invalidCreate: true })),
+        /schema validation/,
+      )
+      assert.deepEqual(sm.calls, [])
+    })
+  })
+
+  describe("logs", () => {
+    const capture = () => {
+      const lines = []
+      const write = (line) => lines.push(line)
+      return { lines, log: { info: write, warn: write, error: write } }
+    }
+
+    test("um ciclo completo não registra nenhum valor", async () => {
+      const { lines, log } = capture()
+      sm.startRotation("token-1")
+      for (const name of STEPS) await step(name, "token-1", service.adapter(), log)
+      assert.ok(lines.length > 0)
+      assert.equal(lines.join("\n").includes("secret-cred"), false)
+    })
+
+    test("segredo inválido registra só campo e código", async () => {
+      const { lines, log } = capture()
+      sm.versions.get("v-initial").value = JSON.stringify({ api_key: "secret-curto-demais-x", key_id: "" })
+      sm.startRotation("token-1")
+      await assert.rejects(() => step("createSecret", "token-1", service.adapter(), log))
+      const output = lines.join("\n")
+      assert.equal(output.includes("secret-curto"), false)
+      assert.match(output, /"field":"key_id"/)
+    })
+
+    test("JSON inválido não reproduz o valor no erro nem no log", async () => {
+      const { lines, log } = capture()
+      sm.versions.get("v-initial").value = "secret-sem-json"
+      sm.startRotation("token-1")
+      await assert.rejects(
+        () => step("createSecret", "token-1", service.adapter(), log),
+        (err) => !err.message.includes("secret-sem-json"),
+      )
+      assert.equal(lines.join("\n").includes("secret-sem-json"), false)
+    })
+  })
+
+  describe("handler", () => {
+    const run = (overrides = {}) =>
+      handleEvent({
+        event: { Step: "createSecret", SecretId: SECRET_ID, ClientRequestToken: "token-1" },
+        serviceName: "fake",
+        getAdapter: () => service.adapter(),
+        deps: sm.deps,
+        log: silent,
+        ...overrides,
+      })
+
+    test("seleciona o adaptador pelo nome do serviço", async () => {
+      let received
+      sm.startRotation("token-1")
+      await run({
+        getAdapter: (name) => {
+          received = name
+          return service.adapter()
         },
-        putSecret: async () => ({ VersionId: "v1" }),
-        putParameter: async () => {},
-      },
-    }
-  }
-
-  test("DELETE returns 404: function exits without error", async () => {
-    const { deps } = buildSuccessfulDeps(404)
-
-    // Must NOT throw â€” 404 means key already revoked, that's idempotent success
-    await assert.doesNotReject(
-      () => rotate({
-        currentKeyToken: "re_CurrentToken123",
-        oldKeyId: "old_key_404",
-        secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-        parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-        deps,
-      }),
-    )
-  })
-
-  test("DELETE returns 500: function exits without error (soft failure)", async () => {
-    const { deps } = buildSuccessfulDeps(500)
-
-    // Must NOT throw â€” non-2xx DELETE is a warning, not an error
-    await assert.doesNotReject(
-      () => rotate({
-        currentKeyToken: "re_CurrentToken123",
-        oldKeyId: "old_key_500",
-        secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-        parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-        deps,
-      }),
-    )
-  })
-
-  test("DELETE network error: function exits without error (soft failure)", async () => {
-    const deps = {
-      getCurrentKeyId: async () => "some_other_id",
-      callResendApi: async (method) => {
-        if (method === "POST") {
-          return { status: 201, data: { id: "new_k", object: "api_key", token: "re_NewToken12345" } }
-        }
-        throw new Error("Network timeout")
-      },
-      putSecret: async () => ({ VersionId: "v1" }),
-      putParameter: async () => {},
-    }
-
-    // Must NOT throw â€” network errors on DELETE are soft failures
-    await assert.doesNotReject(
-      () => rotate({
-        currentKeyToken: "re_CurrentToken123",
-        oldKeyId: "old_key_net",
-        secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-        parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-        deps,
-      }),
-    )
-  })
-})
-
-describe("rotate â€” failure at breakpoints", () => {
-  const baseParams = {
-    currentKeyToken: "re_CurrentToken123",
-    oldKeyId: "old_key_break",
-    secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-    parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-  }
-
-  test("Zod validation failure on key creation: DELETE never called", async () => {
-    let deleteCalled = false
-
-    const deps = {
-      getCurrentKeyId: async () => "some_other_id",
-      callResendApi: async (method) => {
-        if (method === "DELETE") deleteCalled = true
-        // Return an invalid payload that fails createKeySchema
-        return { status: 200, data: { id: "k1", object: "wrong_literal", token: "re_ValidToken12345" } }
-      },
-      putSecret: async () => ({ VersionId: "v1" }),
-      putParameter: async () => {},
-    }
-
-    // Use a token that does NOT match re_* pattern so partial-idempotency is skipped
-    // and POST is actually called, exercising the Zod validation path.
-    await assert.rejects(
-      () => rotate({ ...baseParams, currentKeyToken: "invalid_token_forces_post", deps }),
-      /schema validation/i,
-    )
-
-    assert.equal(deleteCalled, false, "DELETE must not be called after Zod failure")
-  })
-
-  test("PutSecretValue throws: DELETE never called", async () => {
-    let deleteCalled = false
-
-    const deps = {
-      getCurrentKeyId: async () => "some_other_id",
-      callResendApi: async (method) => {
-        if (method === "DELETE") deleteCalled = true
-        return { status: 201, data: { id: "new_k", object: "api_key", token: "re_NewToken12345" } }
-      },
-      putSecret: async () => { throw new Error("AWS PutSecretValue failed") },
-      putParameter: async () => {},
-    }
-
-    await assert.rejects(
-      () => rotate({ ...baseParams, deps }),
-      /PutSecretValue|AWS/i,
-    )
-
-    assert.equal(deleteCalled, false, "DELETE must not be called after putSecret failure")
-  })
-
-  test("PutParameter throws: DELETE never called", async () => {
-    let deleteCalled = false
-
-    const deps = {
-      getCurrentKeyId: async () => "some_other_id",
-      callResendApi: async (method) => {
-        if (method === "DELETE") deleteCalled = true
-        return { status: 201, data: { id: "new_k", object: "api_key", token: "re_NewToken12345" } }
-      },
-      putSecret: async () => ({ VersionId: "v1" }),
-      putParameter: async () => { throw new Error("AWS PutParameter failed") },
-    }
-
-    await assert.rejects(
-      () => rotate({ ...baseParams, deps }),
-      /AWS PutParameter/i,
-    )
-
-    assert.equal(deleteCalled, false, "DELETE must not be called after putParameter failure")
-  })
-})
-
-describe("rotate â€” full idempotency", () => {
-  test("exits early when currentKeyId === oldKeyId, no other deps called", async () => {
-    const sameId = "same_key_id"
-    const calls = []
-
-    const deps = {
-      getCurrentKeyId: async () => { calls.push("getCurrentKeyId"); return sameId },
-      callResendApi: async () => { calls.push("callResendApi"); return {} },
-      putSecret: async () => { calls.push("putSecret"); return { VersionId: "v1" } },
-      putParameter: async () => { calls.push("putParameter") },
-    }
-
-    await rotate({
-      currentKeyToken: "re_OldToken12345",
-      oldKeyId: sameId,
-      secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-      parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-      deps,
+      })
+      assert.equal(received, "fake")
+      assert.equal(service.created, 1)
     })
 
-    assert.deepEqual(calls, ["getCurrentKeyId"], "only getCurrentKeyId should be called")
-    assert.ok(!calls.includes("callResendApi"), "callResendApi must not be called")
-    assert.ok(!calls.includes("putSecret"), "putSecret must not be called")
-    assert.ok(!calls.includes("putParameter"), "putParameter must not be called")
-  })
-})
+    test("erro relançado e log não carregam dados da falha original", async () => {
+      const lines = []
+      const log = { info() {}, warn() {}, error: (line) => lines.push(line) }
+      sm.startRotation("token-1")
+      const adapter = service.adapter()
+      adapter.create = async () => {
+        const err = new TypeError("falha com secret-vazado")
+        throw err
+      }
 
-describe("rotate â€” happy path", () => {
-  test("creates key, saves to SM, saves to SSM, revokes old key", async () => {
-    const calls = []
-    const newKeyId = "new_key_abc"
-    const newKeyToken = "re_NewKeyToken12345"
-    const oldKeyId = "old_key_xyz"
-    const currentKeyToken = "not_a_resend_token_123"
-
-    const deps = {
-      getCurrentKeyId: async () => { calls.push("getCurrentKeyId"); return "some_other_id" },
-      callResendApi: async (method, path) => {
-        calls.push(`callResendApi:${method}:${path}`)
-        if (method === "POST") {
-          return { status: 201, data: { id: newKeyId, object: "api_key", token: newKeyToken } }
-        }
-        if (method === "DELETE") {
-          return { status: 200, data: { object: "api_key", id: oldKeyId, deleted: true } }
-        }
-      },
-      putSecret: async () => { calls.push("putSecret"); return { VersionId: "v1" } },
-      putParameter: async () => { calls.push("putParameter") },
-    }
-
-    await rotate({
-      currentKeyToken,
-      oldKeyId,
-      secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-      parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-      deps,
+      await assert.rejects(
+        () => run({ getAdapter: () => adapter, log }),
+        (err) => {
+          assert.equal(err.name, "RotationError")
+          assert.equal(err.message, "Rotation failed at step createSecret")
+          assert.equal(err.cause, undefined)
+          assert.equal(String(err.stack).includes("secret-vazado"), false)
+          return true
+        },
+      )
+      assert.deepEqual(lines.map((line) => JSON.parse(line)), [{ error: "TypeError", step: "createSecret" }])
     })
 
-    assert.ok(calls.includes("getCurrentKeyId"), "should call getCurrentKeyId")
-    assert.ok(calls.includes("callResendApi:POST:/api-keys"), "should POST to create key")
-    assert.ok(calls.includes("putSecret"), "should save to Secrets Manager")
-    assert.ok(calls.includes("putParameter"), "should save to Parameter Store")
-    assert.ok(calls.includes(`callResendApi:DELETE:/api-keys/${oldKeyId}`), "should DELETE old key")
-
-    const postIdx = calls.indexOf("callResendApi:POST:/api-keys")
-    const putSecretIdx = calls.indexOf("putSecret")
-    const putParamIdx = calls.indexOf("putParameter")
-    const deleteIdx = calls.indexOf(`callResendApi:DELETE:/api-keys/${oldKeyId}`)
-    assert.ok(postIdx < putSecretIdx, "POST should happen before putSecret")
-    assert.ok(putSecretIdx < putParamIdx, "putSecret should happen before putParameter")
-    assert.ok(putParamIdx < deleteIdx, "putParameter should happen before DELETE")
-  })
-})
-
-describe("rotate â€” partial idempotency", () => {
-  test("skips key generation when SM already has new key, goes to revocation", async () => {
-    const newKeyId = "new_key_partial"
-    const newKeyToken = "re_NewKeyPartial123"
-    const oldKeyId = "old_key_partial"
-    const calls = []
-
-    const deps = {
-      getCurrentKeyId: async () => { calls.push("getCurrentKeyId"); return newKeyId },
-      callResendApi: async (method) => {
-        calls.push(`callResendApi:${method}`)
-        if (method === "DELETE") {
-          return { status: 200, data: { object: "api_key", id: oldKeyId, deleted: true } }
-        }
-        return { status: 201, data: {} }
-      },
-      putSecret: async () => { calls.push("putSecret"); return { VersionId: "v1" } },
-      putParameter: async () => { calls.push("putParameter") },
-    }
-
-    await rotate({
-      currentKeyToken: newKeyToken,
-      oldKeyId,
-      secretArn: "arn:aws:secretsmanager:us-east-1:123:secret:test",
-      parameterArn: "arn:aws:ssm:us-east-1:123:parameter/test",
-      deps,
+    test("adaptador inexistente encerra sem efeito colateral", async () => {
+      sm.startRotation("token-1")
+      await assert.rejects(() => run({ getAdapter }), { name: "RotationError" })
+      assert.deepEqual(sm.calls, [])
     })
+  })
 
-    assert.ok(!calls.includes("callResendApi:POST"), "POST should NOT be called (skip generation)")
-    assert.ok(calls.includes("callResendApi:DELETE"), "DELETE should be called (revocation)")
-    assert.ok(calls.includes("putSecret"), "putSecret should be called")
-    assert.ok(calls.includes("putParameter"), "putParameter should be called")
+  describe("registro de adaptadores", () => {
+    test("rejeita serviço desconhecido e nomes herdados do Object", () => {
+      assert.throws(() => getAdapter("inexistente"), /not found/)
+      assert.throws(() => getAdapter("constructor"), /not found/)
+    })
   })
 })
-
